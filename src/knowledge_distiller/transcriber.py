@@ -1,11 +1,11 @@
-"""ASR transcription backends: Qwen3-ASR MLX (primary), mlx-whisper (secondary)."""
+"""ASR transcription backends: Qwen3-ASR (primary), mlx-whisper (secondary)."""
 
 from __future__ import annotations
 
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 # Official Qwen3-ASR HuggingFace model IDs (for qwen-asr / transformers backend)
 QWEN3_MODELS = {
@@ -18,6 +18,45 @@ WHISPER_MODELS = {
     "small": "mlx-community/whisper-small-mlx",
     "base": "mlx-community/whisper-base-mlx",
 }
+
+
+def _select_torch_device() -> str:
+    """Choose the best available PyTorch inference device."""
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _load_qwen3_asr_model(model_id: str, model_size: str):
+    """Load Qwen3-ASR and move its underlying torch model to the best device."""
+    try:
+        import torch
+        from qwen_asr import Qwen3ASRModel  # type: ignore[import]
+    except ImportError as e:
+        raise RuntimeError(
+            "qwen3-asr not installed.\n"
+            "Install: pip install qwen-asr\n"
+            "Or with uv: uv add qwen-asr"
+        ) from e
+
+    device = _select_torch_device()
+    dtype = torch.float16 if device in {"cuda", "mps"} else torch.float32
+    model = Qwen3ASRModel.from_pretrained(model_id, torch_dtype=dtype)
+
+    if hasattr(model, "model"):
+        model.model.to(device)
+        model.model.eval()
+        model.device = next(model.model.parameters()).device
+        model.dtype = getattr(model.model, "dtype", dtype)
+
+    return model
 
 
 def transcribe(
@@ -35,7 +74,7 @@ def transcribe(
         audio_path: Path to audio file (MP3/WAV/M4A etc.)
         language: ISO-639-1 or Qwen3-ASR language code (e.g. "zh", "yue", "en"),
                   or None for auto-detect
-        backend: "qwen3-asr" (default, Apple Silicon), "mlx-whisper"
+        backend: "qwen3-asr" (default), "mlx-whisper"
         model_size: For qwen3-asr: "1.7b" or "0.6b"; for whisper: "large-v3", "small", "base"
         custom_prompt: Custom context hint for Qwen3-ASR transcription
         progress_callback: Called with (progress 0.0-1.0, phase_message)
@@ -44,7 +83,7 @@ def transcribe(
         Transcribed text string.
 
     Notes:
-        - Neither backend requires an API key — all inference is local on Apple Silicon.
+        - Neither backend requires an API key — all inference is local.
         - Qwen3-ASR supports Cantonese ("yue"), Mandarin ("zh"), 50+ other languages.
         - mlx-whisper supports general multilingual transcription.
     """
@@ -55,19 +94,21 @@ def transcribe(
             raise RuntimeError("ffmpeg not found. Install: brew install ffmpeg")
         if not _shutil.which("ffprobe"):
             raise RuntimeError("ffprobe not found. Install: brew install ffmpeg")
-        # M10: _transcribe_qwen3_mlx_chunked handles both short and long audio
-        return _transcribe_qwen3_mlx_chunked(
+        # M10: _transcribe_qwen3_chunked handles both short and long audio
+        return _transcribe_qwen3_chunked(
             audio_path, language, model_size, custom_prompt, progress_callback=progress_callback
         )
     elif backend == "mlx-whisper":
         return _transcribe_mlx_whisper(audio_path, language, model_size, progress_callback)
     else:
-        raise ValueError(f"Unknown transcription backend: {backend!r}. Choose: qwen3-asr, mlx-whisper")
+        raise ValueError(
+            f"Unknown transcription backend: {backend!r}. Choose: qwen3-asr, mlx-whisper"
+        )
 
 
-# ─── Qwen3-ASR MLX (primary, no API key needed) ───────────────────────────────
+# ─── Qwen3-ASR (primary, no API key needed) ───────────────────────────────────
 
-def _transcribe_qwen3_mlx(
+def _transcribe_qwen3(
     audio_path: Path,
     language: str | None,
     model_size: str,
@@ -79,21 +120,12 @@ def _transcribe_qwen3_mlx(
     Model is downloaded once to ~/Library/Caches/qwen3-speech/ (or HF cache).
     No API key required.
     """
-    try:
-        from qwen_asr import Qwen3ASRModel  # type: ignore[import]
-    except ImportError as e:
-        raise RuntimeError(
-            "qwen3-asr not installed.\n"
-            "Install: pip install qwen-asr\n"
-            "Or with uv: uv add qwen-asr"
-        ) from e
-
     model_id = QWEN3_MODELS.get(model_size.lower(), QWEN3_MODELS["1.7b"])
 
     if progress_callback:
         progress_callback(0.05, f"Loading Qwen3-ASR {model_size.upper()} model...")
 
-    model = Qwen3ASRModel.from_pretrained(model_id)
+    model = _load_qwen3_asr_model(model_id, model_size)
 
     if progress_callback:
         progress_callback(0.3, "Transcribing with Qwen3-ASR...")
@@ -114,7 +146,7 @@ def _transcribe_qwen3_mlx(
     return results[0].text.strip()
 
 
-def _transcribe_qwen3_mlx_chunked(
+def _transcribe_qwen3_chunked(
     audio_path: Path,
     language: str | None,
     model_size: str,
@@ -126,22 +158,30 @@ def _transcribe_qwen3_mlx_chunked(
     Chunk-based Qwen3-ASR transcription for audio > 90s.
     Uses ffmpeg to split audio into overlapping chunks.
     """
-    try:
-        from qwen_asr import Qwen3ASRModel  # type: ignore[import]
-    except ImportError as e:
-        raise RuntimeError("qwen3-asr not installed. Run: pip install qwen-asr") from e
-
     model_id = QWEN3_MODELS.get(model_size.lower(), QWEN3_MODELS["1.7b"])
 
     if progress_callback:
         progress_callback(0.05, "Loading Qwen3-ASR model...")
-    model = Qwen3ASRModel.from_pretrained(model_id)
+    model = _load_qwen3_asr_model(model_id, model_size)
 
     # Get duration
     duration = _get_audio_duration(audio_path)
     if duration is None or duration <= chunk_seconds:
         # Short audio: single pass
-        return _transcribe_qwen3_mlx(audio_path, language, model_size, custom_prompt, progress_callback)
+        if progress_callback:
+            progress_callback(0.3, "Transcribing with Qwen3-ASR...")
+
+        lang_code = language or "auto"
+        results = model.transcribe(
+            audio=str(audio_path),
+            language=lang_code,
+            context=custom_prompt,
+        )
+
+        if progress_callback:
+            progress_callback(1.0, "Transcription complete")
+
+        return results[0].text.strip() if results else ""
 
     # Split into chunks
     overlap = 6  # seconds of overlap between chunks
@@ -164,7 +204,11 @@ def _transcribe_qwen3_mlx_chunked(
                 progress_callback(0.1 + 0.8 * i / len(chunks), f"Chunk {i+1}/{len(chunks)}...")
 
             lang_code = language or "auto"
-            results = model.transcribe(audio=str(chunk_path), language=lang_code, context=custom_prompt)
+            results = model.transcribe(
+                audio=str(chunk_path),
+                language=lang_code,
+                context=custom_prompt,
+            )
             chunk_text = results[0].text.strip() if results else ""
             texts.append(chunk_text)
 
